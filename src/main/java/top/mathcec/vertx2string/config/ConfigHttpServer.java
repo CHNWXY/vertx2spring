@@ -299,7 +299,9 @@ public class ConfigHttpServer {
                     } else if (annotation.annotationType() == VertxGetValue.class) {
                         VertxGetValue vertxGetValue = (VertxGetValue) annotation;
                         String paramKey = vertxGetValue.value();
-                        items[i2] = h.request().getParam(paramKey);
+                        Object getValue = h.request().getParam(paramKey);
+                        validGetVal(validResult, parameter, clz, getValue);
+                        items[i2] = getValue;
                     } else {
                         makeCommonAnnoParam(i2, items, parameterReflect, h);
                     }
@@ -309,6 +311,108 @@ public class ConfigHttpServer {
                 p.fail(e);
             }
         });
+    }
+
+    private void validGetVal(ValidResult validResult, Parameter parameter, Class<?> classType, Object o) {
+        Class<?> fieldType = parameter.getType();
+        boolean notNull = parameter.isAnnotationPresent(VertxNotNull.class);
+        VertxNotNull vertxNotNull = parameter.getDeclaredAnnotation(VertxNotNull.class);
+        if (notNull && o == null) {
+            validResult.error(classType, fieldType, vertxNotNull.errorMsg());
+            return;
+        }
+        if (!notNull && o == null) {
+            return;
+        }
+        //先判断值的符合情况
+        VertxValue vertxValue = parameter.getDeclaredAnnotation(VertxValue.class);
+        boolean hasVertxValue = parameter.isAnnotationPresent(VertxValue.class);
+
+        VertxMin vertxMin = parameter.getDeclaredAnnotation(VertxMin.class);
+        boolean hasVertxMin = parameter.isAnnotationPresent(VertxMin.class);
+
+        VertxMax vertxMax = parameter.getDeclaredAnnotation(VertxMax.class);
+        boolean hasVertxMax = parameter.isAnnotationPresent(VertxMax.class);
+
+        VertxStringRegex vertxStringRegex = parameter.getDeclaredAnnotation(VertxStringRegex.class);
+        boolean hasVertxStringRegex = parameter.isAnnotationPresent(VertxStringRegex.class);
+
+        if (
+                fieldType == byte.class || fieldType == Byte.class ||
+                        fieldType == short.class || fieldType == Short.class ||
+                        fieldType == char.class || fieldType == Character.class ||
+                        fieldType == int.class || fieldType == Integer.class ||
+                        fieldType == long.class || fieldType == Long.class ||
+                        fieldType == float.class || fieldType == Float.class ||
+                        fieldType == double.class || fieldType == Double.class) {
+//首先判断有没有value
+            if (hasVertxValue) {
+                boolean hasVal = false;
+                for (int j = 0; j < vertxValue.value().length; j++) {
+                    String val = vertxValue.value()[j];
+                    if (o.toString().equals(val)) {
+                        hasVal = true;
+                        break;
+                    }
+                }
+                if (!hasVal) {
+                    validResult.error(classType, fieldType, vertxValue.errorMsg());
+                } else {
+                    return;
+                }
+            }
+            if (hasVertxMin) {
+                double aDouble = Double.parseDouble(o.toString());
+                if (vertxMin.min() > aDouble) {
+                    validResult.error(classType, fieldType, vertxMin.errorMsg());
+                    return;
+                }
+            }
+            if (hasVertxMax) {
+                double aDouble = Double.parseDouble(o.toString());
+                if (vertxMax.max() < aDouble) {
+                    validResult.error(classType, fieldType, vertxMax.errorMsg());
+                    return;
+                }
+            }
+        }
+        if (fieldType == String.class) {
+            if (hasVertxValue) {
+                boolean hasVal = false;
+                for (int j = 0; j < vertxValue.value().length; j++) {
+                    String val = vertxValue.value()[j];
+                    if (o.toString().equals(val)) {
+                        hasVal = true;
+                        break;
+                    }
+                }
+                if (!hasVal) {
+                    validResult.error(classType, fieldType, vertxValue.errorMsg());
+                } else {
+                    return;
+                }
+            }
+            if (hasVertxMin) {
+                int len = o.toString().length();
+                if (vertxMin.min() > len) {
+                    validResult.error(classType, fieldType, vertxMin.errorMsg());
+                    return;
+                }
+            }
+            if (hasVertxMax) {
+                int len = o.toString().length();
+                if (vertxMax.max() < len) {
+                    validResult.error(classType, fieldType, vertxMax.errorMsg());
+                    return;
+                }
+            }
+            if (hasVertxStringRegex) {
+                if (!o.toString().matches(vertxStringRegex.regex())) {
+                    validResult.error(classType, fieldType, vertxStringRegex.errorMsg());
+                    return;
+                }
+            }
+        }
     }
 
     private void handlerResult(Object o, RoutingContext h) {
@@ -430,5 +534,4 @@ public class ConfigHttpServer {
                     respErr(f, h);
                 });
     }
-
 }
