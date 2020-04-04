@@ -10,11 +10,11 @@ import io.vertx.ext.web.RoutingContext;
 import lombok.Setter;
 import lombok.experimental.Accessors;
 import top.mathcec.vertx2string.annotation.http.*;
+import top.mathcec.vertx2string.annotation.http.valid.*;
 import top.mathcec.vertx2string.constant.RequestMethod;
 import top.mathcec.vertx2string.exception.AutowiredParameterException;
-import top.mathcec.vertx2string.exception.NullFilterException;
-import top.mathcec.vertx2string.exception.UnSupportAutoConvertPostFiledException;
 import top.mathcec.vertx2string.filter.VertxBaseFilter;
+import top.mathcec.vertx2string.pojo.ValidResult;
 import top.mathcec.vertx2string.pojo.reflect.ClassReflect;
 import top.mathcec.vertx2string.pojo.reflect.MethodReflect;
 import top.mathcec.vertx2string.pojo.reflect.ParameterReflect;
@@ -23,7 +23,6 @@ import top.mathcec.vertx2string.read1class.ReflectMethodParamsAnnotation;
 import top.mathcec.vertx2string.read1class.ReflectMethodWithAnnotation;
 import top.mathcec.vertx2string.utils.ArrayUtils;
 
-import javax.xml.namespace.QName;
 import java.io.IOException;
 import java.lang.annotation.Annotation;
 import java.lang.reflect.Field;
@@ -40,7 +39,7 @@ public class ConfigHttpServer {
     public void process() throws IOException, ClassNotFoundException, InvocationTargetException, NoSuchMethodException, InstantiationException, IllegalAccessException {
         exception();
         filter();
-        ReflectClassWithAnnotation reflectClassWithAnnotation = new ReflectClassWithAnnotation(VertxRestController.class);
+        ReflectClassWithAnnotation reflectClassWithAnnotation = new ReflectClassWithAnnotation(VertxRestController.class, "top");
         //需要对这个类进行操作，获取相关的方法
         List<ClassReflect> classList = reflectClassWithAnnotation.getClassList();
         for (int i = 0; i < classList.size(); i++) {
@@ -60,18 +59,22 @@ public class ConfigHttpServer {
                 ReflectMethodParamsAnnotation reflectMethodParamsAnnotation = new ReflectMethodParamsAnnotation(method, List.of(VertxRequestHeader.class, VertxGetValue.class, VertxRequestBody.class));
                 //在这之前获取过滤器
                 doFilter(url, method);
+                //获取参数校验结果
+                ValidResult validResult = new ValidResult();
                 if (requestMethod == RequestMethod.GET) {
-                    get(url, method, clz, reflectMethodParamsAnnotation.getParameterReflectArrayList());
+                    get(url, method, clz, reflectMethodParamsAnnotation.getParameterReflectArrayList(), validResult);
                 } else if (requestMethod == RequestMethod.POST) {
-                    post(url, method, clz, reflectMethodParamsAnnotation.getParameterReflectArrayList());
+                    post(url, method, clz, reflectMethodParamsAnnotation.getParameterReflectArrayList(), validResult);
                 }
             }
         }
     }
 
-    private void post(String url, Method method, Class<?> clz, List<ParameterReflect> parameterReflects) {
+    private void post(String url, Method method, Class<?> clz
+            , List<ParameterReflect> parameterReflects
+            , ValidResult validResult) {
         router.post(url).handler(h -> {
-            Future<Object> exec = execPost(h, method, clz, parameterReflects);
+            Future<Object> exec = execPost(h, method, clz, parameterReflects, validResult);
             exec.onSuccess(s -> {
                 handlerResult(s, h);
             }).onFailure(f -> {
@@ -80,7 +83,9 @@ public class ConfigHttpServer {
         });
     }
 
-    private Future<Object> execPost(RoutingContext h, Method method, Class<?> clz, List<ParameterReflect> parameterReflectList) {
+    private Future<Object> execPost(RoutingContext h, Method method, Class<?> clz
+            , List<ParameterReflect> parameterReflectList
+            , ValidResult validResult) {
         return Future.future(p -> {
             try {
                 Object[] items = new Object[parameterReflectList.size()];
@@ -95,7 +100,7 @@ public class ConfigHttpServer {
                     tempParameter = parameterReflect.getParameter();
                     Annotation annotation = parameterReflect.getAnnotation();
                     if (annotation == null) {
-                        makeRequestParam(i, items, parameterReflect, h);
+                        makeRequestParam(i, items, parameterReflect, h, validResult);
                     } else if (annotation.annotationType() == VertxRequestBody.class) {
                         bodyIndex = i;
                         if (bodyFlag++ >= 1) {
@@ -108,7 +113,13 @@ public class ConfigHttpServer {
                 }
                 if (tempParameter != null) {
                     Future<?> getBody = handleBody(items, h, bodyIndex, tempParameter);
+                    Class<?> bodyType = tempParameter.getType();
                     getBody.onSuccess(o -> {
+                        try {
+                            handlerValid(validResult, o, bodyType);
+                        } catch (IllegalAccessException e) {
+                            p.fail(e);
+                        }
                         invoke(method, p, clz, items);
                     }).onFailure(p::fail);
                 } else {
@@ -124,7 +135,6 @@ public class ConfigHttpServer {
     private void invoke(Method method, Promise<Object> p, Class<?> clz, Object[] items) {
         try {
             //只能自动注入一个，后面的忽略
-            System.out.println(Arrays.toString(items));
             Object invoke = method.invoke(clz.getDeclaredConstructor().newInstance(), items);
             p.complete(invoke);
         } catch (Exception e) {
@@ -132,14 +142,123 @@ public class ConfigHttpServer {
         }
     }
 
-    private Future<Void> handleBody(Object[] items, RoutingContext h, int i, Parameter parameter) {
+    private void handlerValid(ValidResult validResult, Object o, Class<?> type) throws IllegalAccessException {
+        Field[] declaredFields = type.getDeclaredFields();
+        for (int i = 0; i < declaredFields.length; i++) {
+            Field field = declaredFields[i];
+            field.setAccessible(true);
+            Object fieldVal = field.get(o);
+            Class<?> fieldType = field.getType();
+            //先判断是否允许为空，如果允许为空，则可以直接进行下面的判断；如果不允许为空就且为空 直接失败
+            boolean notNull = field.isAnnotationPresent(VertxNotNull.class);
+            VertxNotNull vertxNotNull = field.getDeclaredAnnotation(VertxNotNull.class);
+            if (notNull && fieldVal == null) {
+                validResult.error(type, fieldType, vertxNotNull.errorMsg());
+                return;
+            }
+            if (!notNull && fieldVal == null) {
+                continue;
+            }
+            //先判断值的符合情况
+            VertxValue vertxValue = field.getDeclaredAnnotation(VertxValue.class);
+            boolean hasVertxValue = field.isAnnotationPresent(VertxValue.class);
+
+            VertxMin vertxMin = field.getDeclaredAnnotation(VertxMin.class);
+            boolean hasVertxMin = field.isAnnotationPresent(VertxMin.class);
+
+            VertxMax vertxMax = field.getDeclaredAnnotation(VertxMax.class);
+            boolean hasVertxMax = field.isAnnotationPresent(VertxMax.class);
+
+            VertxStringRegex vertxStringRegex = field.getDeclaredAnnotation(VertxStringRegex.class);
+            boolean hasVertxStringRegex = field.isAnnotationPresent(VertxStringRegex.class);
+            if (
+                    fieldType == byte.class || fieldType == Byte.class ||
+                            fieldType == short.class || fieldType == Short.class ||
+                            fieldType == char.class || fieldType == Character.class ||
+                            fieldType == int.class || fieldType == Integer.class ||
+                            fieldType == long.class || fieldType == Long.class ||
+                            fieldType == float.class || fieldType == Float.class ||
+                            fieldType == double.class || fieldType == Double.class) {
+//首先判断有没有value
+                if (hasVertxValue) {
+                    boolean hasVal = false;
+                    for (int j = 0; j < vertxValue.value().length; j++) {
+                        String val = vertxValue.value()[j];
+                        if (fieldVal.toString().equals(val)) {
+                            hasVal = true;
+                            break;
+                        }
+                    }
+                    if (!hasVal) {
+                        validResult.error(type, fieldType, vertxValue.errorMsg());
+                    } else {
+                        continue;
+                    }
+                }
+                if (hasVertxMin) {
+                    double aDouble = Double.parseDouble(fieldVal.toString());
+                    if (vertxMin.min() > aDouble) {
+                        validResult.error(type, fieldType, vertxMin.errorMsg());
+                        return;
+                    }
+                }
+                if (hasVertxMax) {
+                    double aDouble = Double.parseDouble(fieldVal.toString());
+                    if (vertxMax.max() < aDouble) {
+                        validResult.error(type, fieldType, vertxMax.errorMsg());
+                        return;
+                    }
+                }
+            }
+            if (fieldType == String.class) {
+                if (hasVertxValue) {
+                    boolean hasVal = false;
+                    for (int j = 0; j < vertxValue.value().length; j++) {
+                        String val = vertxValue.value()[j];
+                        if (fieldVal.toString().equals(val)) {
+                            hasVal = true;
+                            break;
+                        }
+                    }
+                    if (!hasVal) {
+                        validResult.error(type, fieldType, vertxValue.errorMsg());
+                    } else {
+                        continue;
+                    }
+                }
+                if (hasVertxMin) {
+                    int len = fieldVal.toString().length();
+                    if (vertxMin.min() > len) {
+                        validResult.error(type, fieldType, vertxMin.errorMsg());
+                        return;
+                    }
+                }
+                if (hasVertxMax) {
+                    int len = fieldVal.toString().length();
+                    if (vertxMax.max() < len) {
+                        validResult.error(type, fieldType, vertxMax.errorMsg());
+                        return;
+                    }
+                }
+                if (hasVertxStringRegex) {
+                    if (!fieldVal.toString().matches(vertxStringRegex.regex())) {
+                        validResult.error(type, fieldType, vertxStringRegex.errorMsg());
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    private Future<Object> handleBody(Object[] items, RoutingContext h, int i, Parameter parameter) {
         return Future.future(p -> {
             try {
                 h.request().bodyHandler(b -> {
                     try {
                         JsonObject bodyAsJson = b.toJsonObject();
-                        items[i] = bodyAsJson.mapTo(parameter.getType());
-                        p.complete();
+                        Object o = bodyAsJson.mapTo(parameter.getType());
+                        items[i] = o;
+                        p.complete(o);
                     } catch (Exception e) {
                         p.fail(e);
                     }
@@ -151,9 +270,11 @@ public class ConfigHttpServer {
         });
     }
 
-    private void get(String url, Method method, Class<?> clz, List<ParameterReflect> parameterReflectList) {
+    private void get(String url, Method method, Class<?> clz
+            , List<ParameterReflect> parameterReflectList
+            , ValidResult validResult) {
         router.get(url).handler(h -> {
-            Future<Object> exec = execGet(h, method, clz, parameterReflectList);
+            Future<Object> exec = execGet(h, method, clz, parameterReflectList, validResult);
             exec.onSuccess(out -> {
                 handlerResult(out, h);
             }).onFailure(f -> {
@@ -163,7 +284,9 @@ public class ConfigHttpServer {
         });
     }
 
-    private Future<Object> execGet(RoutingContext h, Method method, Class<?> clz, List<ParameterReflect> parameterReflectList) {
+    private Future<Object> execGet(RoutingContext h, Method method, Class<?> clz
+            , List<ParameterReflect> parameterReflectList
+            , ValidResult validResult) {
         return Future.future(p -> {
             try {
                 Object[] items = new Object[parameterReflectList.size()];
@@ -172,7 +295,7 @@ public class ConfigHttpServer {
                     Parameter parameter = parameterReflect.getParameter();
                     Annotation annotation = parameterReflect.getAnnotation();
                     if (annotation == null) {
-                        makeRequestParam(i2, items, parameterReflect, h);
+                        makeRequestParam(i2, items, parameterReflect, h, validResult);
                     } else if (annotation.annotationType() == VertxGetValue.class) {
                         VertxGetValue vertxGetValue = (VertxGetValue) annotation;
                         String paramKey = vertxGetValue.value();
@@ -203,7 +326,7 @@ public class ConfigHttpServer {
         }
     }
 
-    private void makeRequestParam(int i, Object[] objects, ParameterReflect parameterReflect, RoutingContext h
+    private void makeRequestParam(int i, Object[] objects, ParameterReflect parameterReflect, RoutingContext h, ValidResult validResult
     ) throws AutowiredParameterException {
         Class<?> type = parameterReflect.getParameter().getType();
         if (type == HttpServerRequest.class) {
@@ -212,6 +335,8 @@ public class ConfigHttpServer {
             objects[i] = h.response();
         } else if (type == RoutingContext.class) {
             objects[i] = h;
+        } else if (type == ValidResult.class) {
+            objects[i] = validResult;
         } else {
             throw new AutowiredParameterException(type);
         }
@@ -244,7 +369,7 @@ public class ConfigHttpServer {
     private void filter() throws IOException, ClassNotFoundException, NoSuchMethodException, IllegalAccessException, InvocationTargetException, InstantiationException {
         Map<String, TreeMap<Integer, VertxBaseFilter>> mapMap = new HashMap<>();
         //找到所有的filter，加入到一个Map的LinkedList中去;
-        ReflectClassWithAnnotation reflectClassWithAnnotation = new ReflectClassWithAnnotation(VertxFilter.class);
+        ReflectClassWithAnnotation reflectClassWithAnnotation = new ReflectClassWithAnnotation(VertxFilter.class, "top");
         List<ClassReflect> classList = reflectClassWithAnnotation.getClassList();
         for (ClassReflect c :
                 classList) {
@@ -263,7 +388,6 @@ public class ConfigHttpServer {
             LinkedList<VertxBaseFilter> vertxBaseFilterLinkedList = new LinkedList<>(treeMap.values());
             FILTER.put(key, vertxBaseFilterLinkedList);
         }
-        System.out.println(FILTER);
     }
 
     private void doFilter(String url, Method method) {
@@ -282,29 +406,29 @@ public class ConfigHttpServer {
             if (vertxBaseFilterLinkedList == null || vertxBaseFilterLinkedList.size() == 0) {
                 return;
             }
-            this.router.route(url).handler(h -> replyFilter(0, vertxBaseFilterLinkedList, h)
-                    .onSuccess(s -> h.next())
-                    .onFailure(f -> respErr(f, h)));
+            Iterator<VertxBaseFilter> vertxBaseFilterIterator = vertxBaseFilterLinkedList.descendingIterator();
+            this.router.route(url).handler(h -> {
+                replayFilter(vertxBaseFilterIterator, h);
+            });
+
         }
     }
 
-    private Future<Void> replyFilter(int i, LinkedList<VertxBaseFilter> vertxBaseFilterLinkedList, RoutingContext routingContext) {
-        return Future.future(p -> {
-            VertxBaseFilter vertxBaseFilter = vertxBaseFilterLinkedList.get(i);
-            if (vertxBaseFilter == null) {
-                p.complete();
-                return;
-            }
-            Future<? super Object> next = vertxBaseFilter.next(routingContext);
-            if (next == null) {
-                p.fail(new NullFilterException(vertxBaseFilter));
-                return;
-            }
-            next.onSuccess(s -> {
-                replyFilter(i + 1, vertxBaseFilterLinkedList, routingContext);
-            }).onFailure(p::fail);
-        });
+    private void replayFilter(Iterator<VertxBaseFilter> vertxBaseFilterIterator, RoutingContext h) {
+        if (!vertxBaseFilterIterator.hasNext()) {
+            h.next();
+            return;
+        }
+        vertxBaseFilterIterator
+                .next()
+                .next(h)
+                .onSuccess(s -> {
+                    replayFilter(vertxBaseFilterIterator, h);
 
+                })
+                .onFailure(f -> {
+                    respErr(f, h);
+                });
     }
 
 }

@@ -5,5 +5,5 @@ import io.vertx.ext.web.RoutingContext;
 
 
 public interface VertxBaseFilter {
-    Future<? super Object> next(RoutingContext routingContext);
+    Future<Void> next(RoutingContext routingContext);
 }

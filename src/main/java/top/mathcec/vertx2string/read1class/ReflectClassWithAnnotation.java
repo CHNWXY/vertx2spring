@@ -38,7 +38,6 @@ public class ReflectClassWithAnnotation {
     public void load() throws IOException, ClassNotFoundException {
         //获取路径
         String path = packageName.replace(".", "/");
-        System.out.println(path);
         String tempPackageName = packageName;
         Enumeration<URL> resources = Thread.currentThread().getContextClassLoader().getResources(path);
         while (resources.hasMoreElements()) {
